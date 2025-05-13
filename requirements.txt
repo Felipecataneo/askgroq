@@ -1,3 +1,3 @@
-fastapi
+streamlit
 groq
-pydantic
+python-dotenv
