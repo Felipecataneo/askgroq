@@ -1,0 +1,16 @@
+{
+    version 2,
+    builds [
+        {
+            src appmain.py,
+            use @vercelpython,
+            config { maxLambdaSize 15mb }
+        }
+    ],
+    routes [
+        {
+            src (.),
+            dest appmain.py
+        }
+    ]
+}
