@@ -10,8 +10,8 @@ from mcp import ClientSession, types # ClientSession ainda é necessário
 from groq import Groq
 from dotenv import load_dotenv
 
-# Importar streamlit_asyncio para lidar com asyncio no Streamlit
-import streamlit_asyncio as sa 
+# REMOVA A IMPORTAÇÃO DE streamlit_asyncio
+# import streamlit_asyncio as sa 
 
 load_dotenv()
 
@@ -35,29 +35,23 @@ class ToolDefinition(TypedDict):
 class MCP_ChatBotClient:
     def __init__(self, mcp_server_url: str, groq_client: Groq):
         self.mcp_server_url = mcp_server_url
-        self.groq_client = groq_client # Recebe o cliente Groq pré-inicializado
+        self.groq_client = groq_client 
 
-    # --- Funções Assíncronas ---
+    # --- Funções Assíncronas (estas continuarão assíncronas) ---
 
-    # Esta função será chamada apenas uma vez (ou até o TTL expirar) e retornará a sessão MCP
-    # Use sa.memo para funções assíncronas que devem ser cacheadas
-    @sa.memo(ttl=3600) # Persiste a conexão por até 1 hora
-    async def _connect_mcp_session(self) -> ClientSession:
+    async def _connect_mcp_session_async(self) -> ClientSession:
         """Conecta ao servidor MCP e retorna a sessão."""
         st.info(f"Conectando ao servidor MCP em: {self.mcp_server_url}")
         try:
-            # SseClientTransport é para conexões de longa duração e persistentes
             transport = SseClientTransport(self.mcp_server_url)
-            session = await transport.connect() # Conecta e inicializa a sessão
+            session = await transport.connect() 
             st.success("Conectado ao servidor MCP com sucesso!")
             return session
         except Exception as e:
             st.error(f"Erro ao conectar ao servidor MCP: {e}")
-            raise # Re-levanta a exceção para que o Streamlit possa lidar com ela
+            raise 
 
-    # Esta função será chamada apenas uma vez (ou até o TTL expirar) e retorna as ferramentas
-    @sa.memo(ttl=3600)
-    async def _load_mcp_tools(self, mcp_session: ClientSession) -> tuple[List[ToolDefinition], Dict[str, ClientSession]]:
+    async def _load_mcp_tools_async(self, mcp_session: ClientSession) -> tuple[List[ToolDefinition], Dict[str, ClientSession]]:
         """Carrega e formata as ferramentas do servidor MCP."""
         try:
             response = await mcp_session.list_tools()
@@ -66,7 +60,7 @@ class MCP_ChatBotClient:
             available_tools = []
             tool_to_session = {}
             for tool in tools:
-                tool_to_session[tool.name] = mcp_session # Mapeia ferramenta para a sessão MCP
+                tool_to_session[tool.name] = mcp_session 
                 available_tools.append({
                     "type": "function",
                     "function": {
@@ -79,15 +73,15 @@ class MCP_ChatBotClient:
             return available_tools, tool_to_session
         except Exception as e:
             st.error(f"Erro ao carregar ferramentas do servidor MCP: {e}")
-            raise # Re-levanta a exceção
+            raise 
 
-    async def process_query(self, query: str, mcp_session: ClientSession, available_tools: List[ToolDefinition], tool_to_session: Dict[str, ClientSession]):
+    async def process_query_async(self, query: str, mcp_session: ClientSession, available_tools: List[ToolDefinition], tool_to_session: Dict[str, ClientSession]):
         """Processa a query do usuário, interagindo com o Groq e ferramentas MCP."""
         messages = [{'role':'user', 'content':query}]
         
         chat_completion = self.groq_client.chat.completions.create(
             messages=messages,
-            model="llama3-8b-8192", # Mantenha o modelo consistente
+            model="llama3-8b-8192", 
             tools=available_tools,
             tool_choice="auto",
             max_tokens=2024
@@ -95,7 +89,7 @@ class MCP_ChatBotClient:
 
         response_placeholder = st.empty() 
         
-        while True: # Loop contínuo para tool_calls
+        while True: 
             response_message = chat_completion.choices[0].message
             
             if response_message.content:
@@ -114,11 +108,10 @@ class MCP_ChatBotClient:
                     
                     try:
                         result = await mcp_session.call_tool(tool_name, arguments=tool_args)
-                        # Garante que o conteúdo seja uma lista de dicionários para serialização JSON
                         tool_output_content = json.dumps([item.dict() if hasattr(item, 'dict') else vars(item) for item in result.content]) 
 
                         st.success(f"Ferramenta {tool_name} executada com sucesso. Resultado:")
-                        st.json(json.loads(tool_output_content)) # Exibe o JSON formatado no Streamlit
+                        st.json(json.loads(tool_output_content)) 
                         
                         messages.append(
                             {
@@ -139,7 +132,7 @@ class MCP_ChatBotClient:
                 
                 chat_completion = self.groq_client.chat.completions.create(
                     messages=messages,
-                    model="llama3-8b-8192",
+                    model="llama3-70b-8192",
                     tools=available_tools,
                     tool_choice="auto",
                     max_tokens=2024
@@ -153,31 +146,47 @@ st.title("EIA Energy Data Chatbot (Powered by MCP & Groq)")
 st.caption("Pergunte sobre dados de energia da EIA. Ex: 'Quais são as principais categorias de dados de energia na EIA?' ou 'Mostre-me os detalhes da rota 'electricity/retail-sales'.'")
 
 # --- Inicialização Global ---
-# Cliente Groq é inicializado uma vez, pois não depende de conexão assíncrona
 if "groq_client_instance" not in st.session_state:
     st.session_state.groq_client_instance = Groq(api_key=GROQ_API_KEY)
 
-# Instância do cliente chatbot que contém a lógica principal.
-# Não armazena a sessão MCP diretamente, mas contém o método para obtê-la.
 if "mcp_chatbot_logic_client" not in st.session_state:
     st.session_state.mcp_chatbot_logic_client = MCP_ChatBotClient(
         MCP_SERVER_URL, st.session_state.groq_client_instance
     )
 
-# --- Conexão MCP Persistente ---
-# Usa sa.memo para gerenciar a sessão MCP e as ferramentas.
-# Retorna a sessão e as ferramentas para serem usadas no process_query.
+# --- Conexão MCP Persistente usando st.cache_resource ---
+# Esta função síncrona executa as corrotinas assíncronas usando asyncio.run()
+# É chamada apenas uma vez por worker/sessão do Streamlit (ou até o TTL expirar).
+@st.cache_resource(ttl=3600) 
+def get_mcp_connection_resources(mcp_server_url: str) -> tuple[ClientSession, List[ToolDefinition], Dict[str, ClientSession]]:
+    print(f"DEBUG: Tentando obter conexão MCP para {mcp_server_url}...")
+    
+    # Obtém o loop de eventos existente ou cria um novo.
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError: # Se não houver um loop rodando
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    temp_client = MCP_ChatBotClient(mcp_server_url, st.session_state.groq_client_instance) 
+
+    # Rodar as corrotinas de conexão e carregamento de ferramentas
+    mcp_session = loop.run_until_complete(temp_client._connect_mcp_session_async())
+    available_tools, tool_to_session = loop.run_until_complete(temp_client._load_mcp_tools_async(mcp_session))
+    
+    return mcp_session, available_tools, tool_to_session
+
+
+# --- Inicialização da Conexão MCP ---
 if "mcp_session" not in st.session_state: 
     st.session_state.connection_status = "pending"
     try:
-        # Chama a função assíncrona memoizada para obter a sessão e ferramentas
-        mcp_session, available_tools, tool_to_session = sa.run(
-            st.session_state.mcp_chatbot_logic_client._connect_mcp_session(),
-            st.session_state.mcp_chatbot_logic_client._load_mcp_tools(mcp_session) # Carrega ferramentas após a sessão
-        )
+        # AQUI CHAMAMOS A FUNÇÃO DE CONEXÃO CACHEADA
+        mcp_session, available_tools, tool_to_session = get_mcp_connection_resources(MCP_SERVER_URL)
+        
         st.session_state.mcp_session = mcp_session
         st.session_state.available_tools = available_tools
-        st.session_state.tool_to_session = tool_to_session # Mapeamento (útil se você tivesse mais de 1 servidor MCP)
+        st.session_state.tool_to_session = tool_to_session
         st.session_state.connection_status = "connected"
     except Exception as e:
         st.session_state.connection_status = "failed"
@@ -208,8 +217,19 @@ if st.session_state.get("connection_status") == "connected":
 
         with st.chat_message("assistant"):
             with st.spinner("Processando..."):
-                # Chama o método assíncrono process_query usando sa.run
-                sa.run(st.session_state.mcp_chatbot_logic_client.process_query(
+                # A chamada para process_query é assíncrona.
+                # Deve ser executada de forma síncrona dentro do contexto do Streamlit.
+                # Usamos run_until_complete com o loop existente.
+                
+                # Obtém o loop de eventos existente ou cria um novo.
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                
+                # Agenda a tarefa e espera a conclusão
+                loop.run_until_complete(st.session_state.mcp_chatbot_logic_client.process_query_async(
                     prompt, 
                     st.session_state.mcp_session, 
                     st.session_state.available_tools, 
@@ -223,8 +243,7 @@ else:
 if st.button("Tentar reconectar ao servidor MCP"):
     if st.session_state.get("connection_status") != "connected":
         # Limpa o cache para forçar uma nova conexão
-        st.session_state.mcp_chatbot_logic_client._connect_mcp_session.clear() # Limpa o cache da função memoizada
-        st.session_state.mcp_chatbot_logic_client._load_mcp_tools.clear() # Limpa o cache das ferramentas também
+        get_mcp_connection_resources.clear() 
         st.session_state.connection_status = "pending"
-        st.session_state.messages = [] # Limpa o histórico de chat
-        st.rerun() # Força o Streamlit a redesenhar a página
+        st.session_state.messages = [] 
+        st.rerun() 
