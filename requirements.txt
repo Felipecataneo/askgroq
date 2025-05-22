@@ -2,4 +2,3 @@ streamlit
 groq
 mcp[sse]
 python-dotenv
-streamlit-asyncio
