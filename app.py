@@ -79,12 +79,21 @@ async def sse_get_tools_and_session(sse_url: str):
                 return session, available_tools, tool_to_session
                 
     except Exception as e:
-        logger.error(f"Erro ao conectar ao servidor MCP: {type(e).__name__}: {e}")
-        # Tratar ExceptionGroup para Python 3.11+
+        error_msg = f"Erro ao conectar ao servidor MCP: {type(e).__name__}: {e}"
+        logger.error(error_msg)
+        
+        # Tratar ExceptionGroup/TaskGroup para Python 3.11+
         if hasattr(e, 'exceptions') and e.exceptions:
-            logger.error("Exceções subjacentes do ExceptionGroup:")
-            for sub_e in e.exceptions:
-                logger.error(f"  - {type(sub_e).__name__}: {sub_e}")
+            logger.error("Exceções subjacentes:")
+            for i, sub_e in enumerate(e.exceptions):
+                logger.error(f"  Sub-exceção {i+1}: {type(sub_e).__name__}: {sub_e}")
+        
+        # Sugestões baseadas no tipo de erro
+        if "connection" in str(e).lower() or "refused" in str(e).lower():
+            logger.error("💡 Sugestão: Verifique se o servidor MCP está rodando e acessível")
+        elif "timeout" in str(e).lower():
+            logger.error("💡 Sugestão: O servidor pode estar sobrecarregado ou lento")
+        
         raise
 
 # --- Função para Executar Tool Call ---
@@ -223,27 +232,45 @@ if "mcp_chatbot_client" not in st.session_state:
 
 # --- Teste de Conexão ---
 @st.cache_data(ttl=300)  # Cache por 5 minutos
-def test_mcp_connection(server_url: str) -> bool:
+def test_mcp_connection(server_url: str) -> tuple[bool, str]:
     """Testa a conexão com o servidor MCP."""
     async def _test():
         try:
             async with sse_client(server_url) as (in_stream, out_stream):
                 async with ClientSession(in_stream, out_stream) as session:
                     await session.initialize()
-                    return True
+                    return True, "Conexão bem-sucedida"
         except Exception as e:
-            st.error(f"Erro de conexão: {e}")
-            return False
+            error_msg = f"Erro de conexão: {type(e).__name__}: {str(e)}"
+            
+            # Tratar TaskGroup/ExceptionGroup específicamente
+            if hasattr(e, 'exceptions') and e.exceptions:
+                error_details = []
+                for i, sub_e in enumerate(e.exceptions):
+                    error_details.append(f"Sub-erro {i+1}: {type(sub_e).__name__}: {str(sub_e)}")
+                error_msg += f"\nDetalhes: {'; '.join(error_details)}"
+            
+            # Verificar se é erro de conexão de rede comum
+            error_str = str(e).lower()
+            if any(keyword in error_str for keyword in ['connection', 'refused', 'timeout', 'unreachable']):
+                error_msg += f"\n💡 Dica: Verifique se o servidor MCP está rodando em {server_url}"
+            
+            return False, error_msg
     
-    return asyncio.run(_test())
+    try:
+        return asyncio.run(_test())
+    except Exception as e:
+        return False, f"Erro crítico ao testar conexão: {type(e).__name__}: {str(e)}"
 
 # --- Status de Conexão ---
-if test_mcp_connection(MCP_SERVER_URL):
+connection_ok, connection_msg = test_mcp_connection(MCP_SERVER_URL)
+
+if connection_ok:
     st.success("✅ Conectado ao servidor MCP")
-    connection_ok = True
 else:
     st.error("❌ Falha na conexão com servidor MCP")
-    connection_ok = False
+    with st.expander("Ver detalhes do erro", expanded=False):
+        st.code(connection_msg, language="text")
 
 # --- Histórico do Chat ---
 if "messages" not in st.session_state:
@@ -295,6 +322,30 @@ with st.sidebar:
     if st.button("🔄 Testar Conexão"):
         test_mcp_connection.clear()  # Limpar cache
         st.rerun()
+    
+    if st.button("🔧 Diagnóstico Detalhado"):
+        st.write("Executando diagnóstico...")
+        
+        # Teste básico de URL
+        if not MCP_SERVER_URL:
+            st.error("URL do servidor MCP não configurada")
+        else:
+            st.info(f"URL configurada: {MCP_SERVER_URL}")
+        
+        # Teste de imports
+        try:
+            from mcp.client.sse import sse_client
+            st.success("✅ Imports MCP OK")
+        except ImportError as e:
+            st.error(f"❌ Erro de import MCP: {e}")
+        
+        # Teste de conexão detalhado
+        connection_ok, connection_msg = test_mcp_connection(MCP_SERVER_URL)
+        if connection_ok:
+            st.success("✅ Conexão MCP OK")
+        else:
+            st.error("❌ Conexão MCP falhou")
+            st.code(connection_msg, language="text")
     
     if st.button("🗑️ Limpar Chat"):
         st.session_state.messages = []
