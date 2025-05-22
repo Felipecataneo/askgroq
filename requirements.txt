@@ -1,5 +1,5 @@
 streamlit
-groq
+google-genai
 mcp
 httpx-sse # Mantenha esta para garantir a dependência da SseClientTransport
 python-dotenv
