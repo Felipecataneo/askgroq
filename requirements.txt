@@ -1,6 +1,6 @@
 streamlit
 groq
-mcp==1.8.0 # Tente uma versão anterior
-httpx-sse
+mcp
+httpx-sse # Mantenha esta para garantir a dependência da SseClientTransport
 python-dotenv
-nest_asyncio
+nest-asyncio

@@ -3,9 +3,10 @@ import asyncio
 import json
 import os
 from typing import List, Dict, TypedDict, Any, Optional, Union
+import logging
 
 # Importações corrigidas:
-from mcp.client.sse import SseClientTransport 
+from mcp.client.sse import sse_client 
 from mcp import ClientSession, types 
 from groq import Groq
 from dotenv import load_dotenv
@@ -15,6 +16,10 @@ import nest_asyncio
 nest_asyncio.apply() 
 
 load_dotenv()
+
+# Configurar logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # --- Configurações ---
 MCP_SERVER_URL = os.getenv("MCP_SERVER_URL")
@@ -32,55 +37,90 @@ class ToolDefinition(TypedDict):
     type: str 
     function: Dict[str, Any]
 
-# --- Cliente Principal para o Chatbot ---
-class MCP_ChatBotClient:
-    def __init__(self, mcp_server_url: str, groq_client: Groq):
-        self.mcp_server_url = mcp_server_url
-        self.groq_client = groq_client 
+# --- Função Global para Conectar e Obter Ferramentas (Padrão Correto) ---
+async def sse_get_tools_and_session(sse_url: str):
+    """
+    Conecta ao servidor MCP usando o padrão correto com async with
+    e retorna session, ferramentas e mapeamento de ferramentas.
+    """
+    logger.info(f"Conectando ao servidor MCP em: {sse_url}")
+    try:
+        # PADRÃO CORRETO: Usar async with sse_client
+        async with sse_client(sse_url) as (in_stream, out_stream):
+            # Criar a sessão MCP sobre essas streams
+            async with ClientSession(in_stream, out_stream) as session:
+                logger.info(f"Conectado a {session.server_info.name} v{session.server_info.version}")
+                
+                # Inicializar a sessão
+                await session.initialize()
+                
+                # Obter lista de ferramentas
+                tools_result = await session.list_tools()
+                
+                # Formatear ferramentas para o Groq
+                available_tools = []
+                tool_to_session = {}
+                
+                for tool in tools_result.tools:
+                    tool_to_session[tool.name] = session
+                    available_tools.append({
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.inputSchema
+                        }
+                    })
+                
+                logger.info(f"Ferramentas carregadas: {[t['function']['name'] for t in available_tools]}")
+                
+                # IMPORTANTE: Retornar os dados, mas a sessão continuará ativa
+                # dentro do contexto async with
+                return session, available_tools, tool_to_session
+                
+    except Exception as e:
+        logger.error(f"Erro ao conectar ao servidor MCP: {type(e).__name__}: {e}")
+        # Tratar ExceptionGroup para Python 3.11+
+        if hasattr(e, 'exceptions') and e.exceptions:
+            logger.error("Exceções subjacentes do ExceptionGroup:")
+            for sub_e in e.exceptions:
+                logger.error(f"  - {type(sub_e).__name__}: {sub_e}")
+        raise
 
-    # --- Funções Assíncronas ---
+# --- Função para Executar Tool Call ---
+async def execute_tool_call(session: ClientSession, tool_name: str, tool_args: dict):
+    """Executa uma chamada de ferramenta no servidor MCP."""
+    try:
+        result = await session.call_tool(tool_name, arguments=tool_args)
+        
+        # Formatar resultado
+        tool_output_content = json.dumps([
+            item.dict() if hasattr(item, 'dict') else vars(item) 
+            for item in result.content
+        ])
+        
+        return tool_output_content
+        
+    except Exception as e:
+        logger.error(f"Erro ao executar ferramenta {tool_name}: {e}")
+        return json.dumps({"error": str(e), "tool_name": tool_name})
 
-    async def _get_persistent_mcp_session(self) -> tuple[ClientSession, Any]:
-        """
-        Conecta ao servidor MCP usando sse_client e retorna uma ClientSession persistente.
-        Retorna também o context manager para evitar que a conexão seja fechada.
-        """
-        st.info(f"Conectando ao servidor MCP em: {self.mcp_server_url}")
-        try:
-            transport_context_manager = sse_client(self.mcp_server_url)
-            read_stream, write_stream = await transport_context_manager.__aenter__() 
-            
-            session = ClientSession(read_stream, write_stream)
+# --- Função Principal de Processamento ---
+async def process_query_with_tools(query: str, groq_client: Groq, sse_url: str):
+    """
+    Processa uma query usando o padrão correto de conexão MCP.
+    Esta função mantém a conexão ativa durante todo o processamento.
+    """
+    # Conectar e obter ferramentas usando o padrão correto
+    async with sse_client(sse_url) as (in_stream, out_stream):
+        async with ClientSession(in_stream, out_stream) as session:
             await session.initialize()
-
-            st.success("Conectado ao servidor MCP com sucesso!")
             
-            return session, transport_context_manager
-        except Exception as e:
-            # CORREÇÃO AQUI: Lidar com ExceptionGroup para Python 3.11+
-            st.error(f"Erro DETALHADO em _get_persistent_mcp_session: {type(e).__name__}: {e}")
-            if isinstance(e, ExceptionGroup) and e.exceptions: # Captura ExceptionGroup
-                st.error("Exceções subjacentes do ExceptionGroup:")
-                for sub_e in e.exceptions:
-                    st.error(f"  - {type(sub_e).__name__}: {sub_e}")
-                    # Se você quer ser MUITO específico, pode procurar por httpx.RequestError etc.
-                    if isinstance(sub_e, httpx.RequestError):
-                        st.error(f"  - ERRO DE REDE: {type(sub_e).__name__}: {sub_e}")
-            elif isinstance(e, httpx.RequestError): # Captura httpx.RequestError diretamente
-                st.error(f"Erro DIRETO DE REDE: {type(e).__name__}: {e}")
-            raise # Re-levanta para ser pego pelo Streamlit
-
-
-    async def _load_mcp_tools_async(self, mcp_session: ClientSession) -> tuple[List[ToolDefinition], Dict[str, ClientSession]]:
-        """Carrega e formata as ferramentas do servidor MCP."""
-        try:
-            response = await mcp_session.list_tools()
-            tools = response.tools
-            
+            # Obter ferramentas
+            tools_result = await session.list_tools()
             available_tools = []
-            tool_to_session = {}
-            for tool in tools:
-                tool_to_session[tool.name] = mcp_session 
+            
+            for tool in tools_result.tools:
                 available_tools.append({
                     "type": "function",
                     "function": {
@@ -89,163 +129,177 @@ class MCP_ChatBotClient:
                         "parameters": tool.inputSchema
                     }
                 })
-            st.info(f"Ferramentas MCP carregadas: {[t['function']['name'] for t in available_tools]}")
-            return available_tools, tool_to_session
-        except Exception as e:
-            st.error(f"Erro DETALHADO em _load_mcp_tools_async: {type(e).__name__}: {e}")
-            raise 
-
-    async def process_query_async(self, query: str, mcp_session: ClientSession, available_tools: List[ToolDefinition], tool_to_session: Dict[str, ClientSession]):
-        """Processa a query do usuário, interagindo com o Groq e ferramentas MCP."""
-        messages = [{'role':'user', 'content':query}]
-        
-        chat_completion = self.groq_client.chat.completions.create(
-            messages=messages,
-            model="llama3-8b-8192", 
-            tools=available_tools,
-            tool_choice="auto",
-            max_tokens=2024
-        )
-
-        response_placeholder = st.empty() 
-        
-        while True: 
-            response_message = chat_completion.choices[0].message
             
-            if response_message.content:
-                response_placeholder.markdown(response_message.content) 
+            st.info(f"Ferramentas disponíveis: {[t['function']['name'] for t in available_tools]}")
             
-            tool_calls = response_message.tool_calls
+            # Iniciar conversa
+            messages = [{'role': 'user', 'content': query}]
             
-            if tool_calls:
-                messages.append(response_message) 
-                
-                for tool_call in tool_calls:
-                    tool_name = tool_call.function.name
-                    tool_args = json.loads(tool_call.function.arguments)
-                    
-                    st.info(f"Chamando ferramenta: {tool_name} com argumentos: {tool_args}")
-                    
-                    try:
-                        result = await mcp_session.call_tool(tool_name, arguments=tool_args)
-                        tool_output_content = json.dumps([item.dict() if hasattr(item, 'dict') else vars(item) for item in result.content]) 
-
-                        st.success(f"Ferramenta {tool_name} executada com sucesso. Resultado:")
-                        st.json(json.loads(tool_output_content)) 
-                        
-                        messages.append(
-                            {
-                                "tool_call_id": tool_call.id,
-                                "role": "tool",
-                                "content": tool_output_content 
-                            }
-                        )
-                    except Exception as e:
-                        st.error(f"Erro DETALHADO ao executar a ferramenta {tool_name}: {type(e).__name__}: {e}")
-                        messages.append(
-                            {
-                                "tool_call_id": tool_call.id,
-                                "role": "tool",
-                                "content": json.dumps({"error": str(e), "tool_name": tool_name}) 
-                            }
-                        )
-                
-                chat_completion = self.groq_client.chat.completions.create(
+            # Placeholder para resposta
+            response_placeholder = st.empty()
+            
+            # Loop de conversação
+            while True:
+                # Chamada para o Groq
+                chat_completion = groq_client.chat.completions.create(
                     messages=messages,
-                    model="llama3-8b-8192",
+                    model="llama3-8b-8192", 
                     tools=available_tools,
                     tool_choice="auto",
                     max_tokens=2024
                 )
-            else:
-                break 
+                
+                response_message = chat_completion.choices[0].message
+                
+                # Mostrar conteúdo da resposta
+                if response_message.content:
+                    response_placeholder.markdown(response_message.content)
+                
+                # Verificar se há chamadas de ferramentas
+                tool_calls = response_message.tool_calls
+                
+                if tool_calls:
+                    messages.append(response_message)
+                    
+                    # Executar cada ferramenta
+                    for tool_call in tool_calls:
+                        tool_name = tool_call.function.name
+                        tool_args = json.loads(tool_call.function.arguments)
+                        
+                        st.info(f"Executando ferramenta: {tool_name}")
+                        st.json(tool_args)
+                        
+                        # Executar ferramenta usando a sessão ativa
+                        tool_output = await execute_tool_call(session, tool_name, tool_args)
+                        
+                        # Mostrar resultado
+                        try:
+                            result_data = json.loads(tool_output)
+                            st.success(f"Ferramenta {tool_name} executada com sucesso:")
+                            st.json(result_data)
+                        except json.JSONDecodeError:
+                            st.success(f"Resultado da ferramenta {tool_name}:")
+                            st.text(tool_output)
+                        
+                        # Adicionar resultado às mensagens
+                        messages.append({
+                            "tool_call_id": tool_call.id,
+                            "role": "tool",
+                            "content": tool_output
+                        })
+                    
+                    # Continuar loop para próxima resposta
+                    continue
+                else:
+                    # Sem mais ferramentas, finalizar
+                    break
+            
+            return response_message.content
+
+# --- Cliente Principal Simplificado ---
+class MCP_ChatBotClient:
+    def __init__(self, mcp_server_url: str, groq_client: Groq):
+        self.mcp_server_url = mcp_server_url
+        self.groq_client = groq_client
+
+    async def process_query(self, query: str):
+        """Processa uma query usando conexão MCP adequada."""
+        return await process_query_with_tools(query, self.groq_client, self.mcp_server_url)
 
 # --- Streamlit UI ---
-st.set_page_config(page_title="Chatbot", page_icon="💡")
+st.set_page_config(page_title="Chatbot MCP", page_icon="💡")
 st.title("EIA Energy Data Chatbot (Powered by MCP & Groq)")
-st.caption("Pergunte sobre dados de energia da EIA. Ex: 'Quais são as principais categorias de dados de energia na EIA?' ou 'Mostre-me os detalhes da rota 'electricity/retail-sales'.'")
+st.caption("Pergunte sobre dados de energia da EIA. Ex: 'Quais são as principais categorias de dados de energia na EIA?'")
 
-# --- Inicialização Global ---
+# --- Inicialização ---
 if "groq_client_instance" not in st.session_state:
     st.session_state.groq_client_instance = Groq(api_key=GROQ_API_KEY)
 
-if "mcp_chatbot_logic_client" not in st.session_state:
-    st.session_state.mcp_chatbot_logic_client = MCP_ChatBotClient(
-        MCP_SERVER_URL, st.session_state.groq_client_instance
+if "mcp_chatbot_client" not in st.session_state:
+    st.session_state.mcp_chatbot_client = MCP_ChatBotClient(
+        MCP_SERVER_URL, 
+        st.session_state.groq_client_instance
     )
 
-# --- Conexão MCP Persistente usando st.cache_resource ---
-@st.cache_resource(ttl=3600) 
-def get_mcp_connection_resources(mcp_server_url: str) -> tuple[ClientSession, List[ToolDefinition], Dict[str, ClientSession]]:
-    print(f"DEBUG: Tentando obter conexão MCP para {mcp_server_url}...")
+# --- Teste de Conexão ---
+@st.cache_data(ttl=300)  # Cache por 5 minutos
+def test_mcp_connection(server_url: str) -> bool:
+    """Testa a conexão com o servidor MCP."""
+    async def _test():
+        try:
+            async with sse_client(server_url) as (in_stream, out_stream):
+                async with ClientSession(in_stream, out_stream) as session:
+                    await session.initialize()
+                    return True
+        except Exception as e:
+            st.error(f"Erro de conexão: {e}")
+            return False
     
-    # Rodar as corrotinas de conexão e carregamento de ferramentas
-    # Usando asyncio.run() com nest_asyncio.apply() para lidar com loops aninhados.
-    mcp_session, transport_context_manager = asyncio.run(st.session_state.mcp_chatbot_logic_client._get_persistent_mcp_session())
-    available_tools, tool_to_session = asyncio.run(st.session_state.mcp_chatbot_logic_client._load_mcp_tools_async(mcp_session))
-    
-    # Armazena o context manager para evitar que o GC chame __aexit__ e feche a conexão.
-    st.session_state._mcp_transport_context_manager = transport_context_manager
-    
-    return mcp_session, available_tools, tool_to_session
+    return asyncio.run(_test())
 
-
-# --- Inicialização da Conexão MCP ---
-if "mcp_session" not in st.session_state: 
-    st.session_state.connection_status = "pending"
-    try:
-        mcp_session, available_tools, tool_to_session = get_mcp_connection_resources(MCP_SERVER_URL)
-        
-        st.session_state.mcp_session = mcp_session
-        st.session_state.available_tools = available_tools
-        st.session_state.tool_to_session = tool_to_session
-        st.session_state.connection_status = "connected"
-    except Exception as e:
-        st.session_state.connection_status = "failed"
-        st.error(f"Falha na conexão inicial ao servidor MCP: {e}")
-        st.stop()
-
-
-# --- Exibição de Status de Conexão ---
-if st.session_state.connection_status == "pending":
-    st.info("Conectando ao servidor MCP...")
-elif st.session_state.connection_status == "connected" and not st.session_state.available_tools:
-     st.warning("Conectado ao servidor MCP, mas nenhuma ferramenta carregada. Verifique os logs do servidor.")
+# --- Status de Conexão ---
+if test_mcp_connection(MCP_SERVER_URL):
+    st.success("✅ Conectado ao servidor MCP")
+    connection_ok = True
+else:
+    st.error("❌ Falha na conexão com servidor MCP")
+    connection_ok = False
 
 # --- Histórico do Chat ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+# Mostrar histórico
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# --- Entrada do Usuário e Processamento da Query ---
-if st.session_state.get("connection_status") == "connected":
-    if prompt := st.chat_input("Pergunte o que quiser..."):
+# --- Interface de Chat ---
+if connection_ok:
+    if prompt := st.chat_input("Digite sua pergunta..."):
+        # Adicionar mensagem do usuário
         st.session_state.messages.append({"role": "user", "content": prompt})
+        
         with st.chat_message("user"):
             st.markdown(prompt)
 
+        # Processar resposta
         with st.chat_message("assistant"):
-            with st.spinner("Processando..."):
-                # A chamada para process_query é assíncrona.
-                # Usa asyncio.run() que será permitido por nest_asyncio.
-                asyncio.run(st.session_state.mcp_chatbot_logic_client.process_query_async(
-                    prompt, 
-                    st.session_state.mcp_session, 
-                    st.session_state.available_tools, 
-                    st.session_state.tool_to_session
-                ))
-
+            with st.spinner("Processando sua pergunta..."):
+                try:
+                    # Usar a nova função de processamento
+                    response = asyncio.run(
+                        st.session_state.mcp_chatbot_client.process_query(prompt)
+                    )
+                    
+                    if response:
+                        st.session_state.messages.append({
+                            "role": "assistant", 
+                            "content": response
+                        })
+                        
+                except Exception as e:
+                    error_msg = f"Erro ao processar consulta: {e}"
+                    st.error(error_msg)
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": error_msg
+                    })
 else:
-    st.warning("Chatbot não disponível. Verifique as configurações de conexão.")
+    st.warning("⚠️ Chatbot indisponível devido a problemas de conexão.")
 
-# --- Botão de Reconexão (para depuração) ---
-if st.button("Tentar reconectar ao servidor MCP"):
-    if st.session_state.get("connection_status") != "connected":
-        # Limpa o cache para forçar uma nova conexão
-        get_mcp_connection_resources.clear() 
-        st.session_state.connection_status = "pending"
-        st.session_state.messages = [] 
-        st.rerun() 
+# --- Controles de Depuração ---
+with st.sidebar:
+    st.header("Configurações")
+    
+    if st.button("🔄 Testar Conexão"):
+        test_mcp_connection.clear()  # Limpar cache
+        st.rerun()
+    
+    if st.button("🗑️ Limpar Chat"):
+        st.session_state.messages = []
+        st.rerun()
+    
+    st.markdown("---")
+    st.markdown(f"**Servidor MCP:** `{MCP_SERVER_URL}`")
+    st.markdown(f"**Status:** {'🟢 Conectado' if connection_ok else '🔴 Desconectado'}")
