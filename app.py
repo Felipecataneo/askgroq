@@ -5,7 +5,7 @@ import os
 from typing import List, Dict, TypedDict, Any, Optional, Union
 
 # Importações corrigidas:
-from mcp.client.sse import sse_client 
+from mcp.client.sse import SseClientTransport 
 from mcp import ClientSession, types 
 from groq import Groq
 from dotenv import load_dotenv
