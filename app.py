@@ -115,20 +115,19 @@ async def execute_tool_call(session: ClientSession, tool_name: str, tool_args: d
         return json.dumps({"error": str(e), "tool_name": tool_name})
 
 # --- Função Principal de Processamento ---
+# No arquivo do chatbot (onde você tem process_query_with_tools)
+
 async def process_query_with_tools(query: str, groq_client: Groq, sse_url: str):
     """
     Processa uma query usando o padrão correto de conexão MCP.
     Esta função mantém a conexão ativa durante todo o processamento.
     """
-    # Conectar e obter ferramentas usando o padrão correto
     async with sse_client(sse_url) as (in_stream, out_stream):
         async with ClientSession(in_stream, out_stream) as session:
             await session.initialize()
             
-            # Obter ferramentas
             tools_result = await session.list_tools()
             available_tools = []
-            
             for tool in tools_result.tools:
                 available_tools.append({
                     "type": "function",
@@ -140,70 +139,122 @@ async def process_query_with_tools(query: str, groq_client: Groq, sse_url: str):
                 })
             
             st.info(f"Ferramentas disponíveis: {[t['function']['name'] for t in available_tools]}")
+
+            # --- PROMPT DE SISTEMA REFORÇADO ---
+            system_prompt = """
+            Você é um assistente especializado em dados de energia da U.S. Energy Information Administration (EIA), acessando dados através de uma API v2.
+            Seu objetivo é responder às perguntas dos usuários usando as seguintes ferramentas: `list_eia_v2_routes`, `get_eia_v2_route_data`, e `get_eia_v2_series_id_data`.
+
+            **REGRAS CRÍTICAS PARA USO DAS FERRAMENTAS:**
+
+            1.  **FLUXO DE DESCOBERTA OBRIGATÓRIO (para perguntas abertas sobre dados):**
+                *   **NÃO assuma rotas ou IDs.** Para perguntas como "Qual a produção de X em Y?" ou "Dados sobre Z", você DEVE seguir este fluxo:
+                *   **Passo 1:** Comece com `list_eia_v2_routes()` (sem argumentos) para ver as categorias de nível superior.
+                *   **Passo 2:** Analise a saída. Se uma categoria parecer relevante (ex: "petroleum"), chame `list_eia_v2_routes(segment_path="nome_da_categoria")` para ver sub-rotas e metadados.
+                *   **Passo 3:** Continue chamando `list_eia_v2_routes` com `segment_path` cada vez mais específico até encontrar:
+                    *   A rota base que contém os dados (ex: "petroleum/supply/monthly").
+                    *   Os `ID do Facet` relevantes nos metadados (ex: `countryRegionId`, `productId`).
+                    *   Os `ID da Coluna` relevantes para os dados solicitados (ex: `value` para produção).
+                    *   O `ID (para query)` da frequência desejada (ex: `A` para anual, `M` para mensal).
+                *   **Passo 4 (Se houver Facets):** Para cada `ID do Facet` que você precisa filtrar (ex: para encontrar "Brasil"), chame `list_eia_v2_routes(segment_path="<rota_base_encontrada>/facet/<ID_do_Facet_desejado>")`. Analise a saída para encontrar o `ID (valor do facet)` correspondente (ex: "BRA" para Brasil).
+                *   **Passo 5:** SOMENTE APÓS completar os passos acima, use `get_eia_v2_route_data` com:
+                    *   `route_path_with_data_segment`: A rota base encontrada + "/data/" (ex: "petroleum/supply/monthly/data/").
+                    *   `data_elements`: Lista dos `ID da Coluna` encontrados.
+                    *   `facets`: Dicionário com `{ID_do_Facet: ID_valor_do_facet}`.
+                    *   `frequency`: O `ID (para query)` da frequência.
+                    *   `start_period`, `end_period` conforme necessário (ex: para "este ano").
+
+            2.  **USO DE `get_eia_v2_series_id_data`:**
+                *   Use esta ferramenta **SOMENTE E EXCLUSIVAMENTE** se o usuário fornecer explicitamente um Series ID completo e formatado como um ID da APIv1 da EIA (ex: "ELEC.SALES.CO-RES.A").
+                *   **NÃO invente, NÃO adivinhe, NÃO construa Series IDs.** Se o usuário não fornecer um Series ID da APIv1, IGNORE esta ferramenta e siga o FLUXO DE DESCOBERTA OBRIGATÓRIO.
+
+            3.  **INTERPRETAÇÃO DA SAÍDA DE `list_eia_v2_routes`:**
+                *   Preste muita atenção aos "ID da Coluna", "ID do Facet", "ID (valor do facet)", e "ID (para query)" da frequência. São esses IDs que você deve usar nos parâmetros das outras ferramentas. Não use os "Nomes" descritivos diretamente como IDs.
+
+            4.  **PERSISTÊNCIA E MÚLTIPLAS CHAMADAS:**
+                *   É esperado que você faça MÚLTIPLAS chamadas a `list_eia_v2_routes` para encontrar os dados corretos. Não tente adivinhar após a primeira chamada. Seja metódico.
+
+            5.  **ANO CORRENTE:**
+                *   Para "este ano" ou "ano corrente", use o ano atual. Se os dados do ano atual não estiverem completos, você pode mencionar isso e fornecer os dados do último ano completo disponível, se apropriado, ou perguntar ao usuário se ele deseja os dados mais recentes, mesmo que parciais.
+
+            Pense passo a passo e explique seu raciocínio antes de chamar uma ferramenta, especialmente ao seguir o fluxo de descoberta.
+            Se você não conseguir encontrar os dados após seguir o fluxo, informe ao usuário que não foi possível localizar os dados específicos com as ferramentas disponíveis.
+            """
+
+            messages = [
+                {'role': 'system', 'content': system_prompt}, # Adiciona o prompt do sistema
+                {'role': 'user', 'content': query}
+            ]
             
-            # Iniciar conversa
-            messages = [{'role': 'user', 'content': query}]
-            
-            # Placeholder para resposta
             response_placeholder = st.empty()
             
-            # Loop de conversação
             while True:
                 # Chamada para o Groq
                 chat_completion = groq_client.chat.completions.create(
                     messages=messages,
                     model="llama3-70b-8192", 
                     tools=available_tools,
-                    tool_choice="auto",
-                    max_tokens=2024
+                    tool_choice="auto", # ou "required" se você quiser forçar uma ferramenta após a primeira resposta com tools
+                    max_tokens=4096 # Aumentar um pouco para respostas mais longas/detalhadas e tool calls
                 )
                 
                 response_message = chat_completion.choices[0].message
                 
-                # Mostrar conteúdo da resposta
+                # Debug: Mostrar a mensagem completa da resposta do LLM
+                # st.write("Resposta do LLM:")
+                # st.json(response_message.dict()) # .dict() é útil para Pydantic models
+                logger.info(f"LLM Response: {response_message}")
+
                 if response_message.content:
                     response_placeholder.markdown(response_message.content)
                 
-                # Verificar se há chamadas de ferramentas
                 tool_calls = response_message.tool_calls
                 
                 if tool_calls:
-                    messages.append(response_message)
+                    # Adicionar a resposta do assistente (que contém a decisão de usar a ferramenta) às mensagens
+                    messages.append(response_message) 
                     
-                    # Executar cada ferramenta
                     for tool_call in tool_calls:
                         tool_name = tool_call.function.name
-                        tool_args = json.loads(tool_call.function.arguments)
-                        
+                        try:
+                            tool_args = json.loads(tool_call.function.arguments)
+                        except json.JSONDecodeError as e:
+                            st.error(f"Erro ao decodificar argumentos da ferramenta {tool_name}: {tool_call.function.arguments}. Erro: {e}")
+                            messages.append({
+                                "tool_call_id": tool_call.id,
+                                "role": "tool",
+                                "name": tool_name,
+                                "content": json.dumps({"error": f"Argumentos JSON inválidos: {e}", "arguments_received": tool_call.function.arguments})
+                            })
+                            continue # Pula para o próximo tool_call ou iteração
+
                         st.info(f"Executando ferramenta: {tool_name}")
-                        st.json(tool_args)
+                        st.json(tool_args) # Mostrar argumentos
                         
-                        # Executar ferramenta usando a sessão ativa
                         tool_output = await execute_tool_call(session, tool_name, tool_args)
                         
-                        # Mostrar resultado
                         try:
-                            result_data = json.loads(tool_output)
-                            st.success(f"Ferramenta {tool_name} executada com sucesso:")
-                            st.json(result_data)
-                        except json.JSONDecodeError:
+                            # Tentar parsear o output como JSON para melhor visualização, se for o caso
+                            tool_output_json = json.loads(tool_output)
                             st.success(f"Resultado da ferramenta {tool_name}:")
+                            st.json(tool_output_json)
+                        except json.JSONDecodeError:
+                            st.success(f"Resultado da ferramenta {tool_name} (texto):")
                             st.text(tool_output)
-                        
-                        # Adicionar resultado às mensagens
+
                         messages.append({
                             "tool_call_id": tool_call.id,
                             "role": "tool",
-                            "content": tool_output
+                            "name": tool_name, # Adicionar o nome da ferramenta aqui é bom para o LLM
+                            "content": tool_output,
                         })
-                    
-                    # Continuar loop para próxima resposta
-                    continue
+                    # Loop de volta para o LLM processar os resultados da ferramenta
                 else:
-                    # Sem mais ferramentas, finalizar
-                    break
+                    # Se não houver tool_calls, a conversa para esta rodada terminou
+                    # Não precisa adicionar response_message novamente se já tem conteúdo e não há tools
+                    break 
             
-            return response_message.content
+            return response_message.content # Retorna o conteúdo final do assistente
 
 # --- Cliente Principal Simplificado ---
 class MCP_ChatBotClient:
