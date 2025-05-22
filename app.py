@@ -40,7 +40,6 @@ class MCP_ChatBotClient:
 
     # --- Funções Assíncronas ---
 
-    # Este é o método que conecta e retorna a sessão MCP persistente.
     async def _get_persistent_mcp_session(self) -> tuple[ClientSession, Any]:
         """
         Conecta ao servidor MCP usando sse_client e retorna uma ClientSession persistente.
@@ -58,11 +57,17 @@ class MCP_ChatBotClient:
             
             return session, transport_context_manager
         except Exception as e:
+            # CORREÇÃO AQUI: Lidar com ExceptionGroup para Python 3.11+
             st.error(f"Erro DETALHADO em _get_persistent_mcp_session: {type(e).__name__}: {e}")
-            # Se for um TaskGroupError, tente extrair a sub-exceção
-            if isinstance(e, asyncio.base_events.TaskGroupError) and e.exceptions:
+            if isinstance(e, ExceptionGroup) and e.exceptions: # Captura ExceptionGroup
+                st.error("Exceções subjacentes do ExceptionGroup:")
                 for sub_e in e.exceptions:
-                    st.error(f"Sub-exceção do TaskGroup: {type(sub_e).__name__}: {sub_e}")
+                    st.error(f"  - {type(sub_e).__name__}: {sub_e}")
+                    # Se você quer ser MUITO específico, pode procurar por httpx.RequestError etc.
+                    if isinstance(sub_e, httpx.RequestError):
+                        st.error(f"  - ERRO DE REDE: {type(sub_e).__name__}: {sub_e}")
+            elif isinstance(e, httpx.RequestError): # Captura httpx.RequestError diretamente
+                st.error(f"Erro DIRETO DE REDE: {type(e).__name__}: {e}")
             raise # Re-levanta para ser pego pelo Streamlit
 
 
