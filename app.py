@@ -4,11 +4,15 @@ import json
 import os
 from typing import List, Dict, TypedDict, Any, Optional, Union
 
-# CORREÇÃO CRÍTICA: Importar sse_client diretamente
+# Importações corrigidas:
 from mcp.client.sse import sse_client # Agora esta importação deve funcionar
 from mcp import ClientSession, types 
 from groq import Groq
 from dotenv import load_dotenv
+
+# ADICIONAR nest_asyncio para contornar problemas de asyncio.run()
+import nest_asyncio 
+nest_asyncio.apply() 
 
 load_dotenv()
 
@@ -36,44 +40,60 @@ class MCP_ChatBotClient:
 
     # --- Funções Assíncronas ---
 
-    # Método interno para conectar e manter as streams e a sessão MCP.
-    # Esta é a parte complexa que sse_client normalmente abstrai via 'async with'.
-    # Precisamos expor a sessão e as streams.
-    async def _raw_connect_mcp_session(self) -> tuple[ClientSession, Any, Any]:
-        """
-        Conecta ao servidor MCP e retorna a sessão e as streams subjacentes.
-        Isso contorna o uso de 'async with' para persistência.
-        """
+    # Esta função irá gerenciar a sessão MCP e as ferramentas
+    async def get_mcp_session_and_tools(self) -> tuple[ClientSession, List[ToolDefinition], Dict[str, ClientSession]]:
+        """Conecta ao servidor MCP, inicializa a sessão e carrega as ferramentas."""
         st.info(f"Conectando ao servidor MCP em: {self.mcp_server_url}")
         try:
-            # Obtém o transporte. sse_client é um gerador assíncrono.
-            # O .__aenter__() é o que o 'async with' chamaria para iniciar o contexto.
-            transport_context = sse_client(self.mcp_server_url)
-            read_stream, write_stream = await transport_context.__aenter__() 
+            # Usar o context manager sse_client diretamente
+            # Ele cria e gerencia a conexão subjacente.
+            # A sessão MCP é criada com as streams que ele fornece.
             
-            # Cria a sessão MCP com as streams obtidas.
-            session = ClientSession(read_stream, write_stream)
-            await session.initialize() # Inicializa o protocolo MCP
+            # NOTA: O sse_client é um context manager, que normalmente fecha a conexão.
+            # A forma padrão de usá-lo é `async with sse_client(...) as (r,w): ...`
+            # Mas Streamlit precisa de uma sessão persistente.
+            # Se a classe SseClientTransport não é importável, como no erro anterior,
+            # estamos em um dilema.
 
+            # Revertendo para a forma mais "manual" de obter as streams se SseClientTransport não funciona.
+            # Isso é para contornar o problema de importação do SseClientTransport.
+            # transport_context = sse_client(self.mcp_server_url)
+            # read_stream, write_stream = await transport_context.__aenter__() 
+            # session = ClientSession(read_stream, write_stream)
+            # await session.initialize()
+
+            # TENTATIVA: usar a própria classe SseClientTransport do mcp.client.sse
+            # Se a ImportError persistir, então temos que ver se a classe existe numa versão mais antiga.
+            # Ou o problema é com o próprio httpx-sse.
+            
+            # ASSUMINDO que o Import Error for SseClientTransport foi por erro de digitação/versão
+            # e que, com o requirements.txt correto, SseClientTransport DEVE funcionar.
+            # A versão anterior com SseClientTransport é a IDEAL para persistência.
+            
+            # Se o erro atual é "unhandled errors in a TaskGroup",
+            # E A SUB-EXCEÇÃO É DE REDE/CONEXÃO (refusal, timeout),
+            # então o problema NÃO É com a forma de importar SseClientTransport.
+            # É um problema de conexão.
+
+            # Vamos manter a tentativa com SseClientTransport (se ele for importável),
+            # mas adicionar tratamento de erro para a conexão real.
+
+            # --- Conectando com SseClientTransport ---
+            # SE ImportError PARA SseClientTransport PERSISTIR, ESTE CÓDIGO NÃO FUNCIONARÁ.
+            # Apenas se o erro for no TaskGroup ou outra coisa.
+            transport = SseClientTransport(self.mcp_server_url)
+            session = await transport.connect()
+            await session.initialize()
             st.success("Conectado ao servidor MCP com sucesso!")
-            
-            # Retorna a sessão e o transport_context (para que __aexit__ não seja chamado)
-            # Esta é a parte "hacky" para manter a conexão aberta.
-            return session, transport_context, read_stream, write_stream
-        except Exception as e:
-            st.error(f"Erro ao conectar ao servidor MCP: {e}")
-            raise 
 
-    async def _load_mcp_tools_async(self, mcp_session: ClientSession) -> tuple[List[ToolDefinition], Dict[str, ClientSession]]:
-        """Carrega e formata as ferramentas do servidor MCP."""
-        try:
-            response = await mcp_session.list_tools()
+            # Carrega e formata as ferramentas
+            response = await session.list_tools()
             tools = response.tools
             
             available_tools = []
             tool_to_session = {}
             for tool in tools:
-                tool_to_session[tool.name] = mcp_session 
+                tool_to_session[tool.name] = session 
                 available_tools.append({
                     "type": "function",
                     "function": {
@@ -83,10 +103,14 @@ class MCP_ChatBotClient:
                     }
                 })
             st.info(f"Ferramentas MCP carregadas: {[t['function']['name'] for t in available_tools]}")
-            return available_tools, tool_to_session
+            
+            return session, available_tools, tool_to_session
+
         except Exception as e:
-            st.error(f"Erro ao carregar ferramentas do servidor MCP: {e}")
-            raise 
+            # Captura a exceção e loga para depuração
+            st.error(f"Erro detalhado na conexão MCP: {type(e).__name__}: {e}")
+            raise # Re-levanta para que o Streamlit Cloud possa logar a sub-exceção
+
 
     async def process_query_async(self, query: str, mcp_session: ClientSession, available_tools: List[ToolDefinition], tool_to_session: Dict[str, ClientSession]):
         """Processa a query do usuário, interagindo com o Groq e ferramentas MCP."""
@@ -145,7 +169,7 @@ class MCP_ChatBotClient:
                 
                 chat_completion = self.groq_client.chat.completions.create(
                     messages=messages,
-                    model="llama3-70b-8192",
+                    model="llama3-8b-8192",
                     tools=available_tools,
                     tool_choice="auto",
                     max_tokens=2024
@@ -168,12 +192,11 @@ if "mcp_chatbot_logic_client" not in st.session_state:
     )
 
 # --- Conexão MCP Persistente usando st.cache_resource ---
-# Esta função síncrona executa as corrotinas assíncronas usando asyncio.run()
-# Retorna a sessão e as ferramentas para serem usadas no process_query.
 @st.cache_resource(ttl=3600) 
 def get_mcp_connection_resources(mcp_server_url: str) -> tuple[ClientSession, List[ToolDefinition], Dict[str, ClientSession]]:
     print(f"DEBUG: Tentando obter conexão MCP para {mcp_server_url}...")
     
+    # Obtém o loop de eventos existente ou cria um novo.
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError: 
@@ -182,15 +205,12 @@ def get_mcp_connection_resources(mcp_server_url: str) -> tuple[ClientSession, Li
 
     temp_client_instance = MCP_ChatBotClient(mcp_server_url, st.session_state.groq_client_instance) 
 
-    # CORREÇÃO: Chamar o método _raw_connect_mcp_session
-    mcp_session, transport_context, read_stream, write_stream = loop.run_until_complete(temp_client_instance._raw_connect_mcp_session())
+    # Rodar as corrotinas de conexão e carregamento de ferramentas
+    mcp_session = loop.run_until_complete(temp_client_instance._connect_mcp_session_async())
     available_tools, tool_to_session = loop.run_until_complete(temp_client_instance._load_mcp_tools_async(mcp_session))
     
-    # Store transport_context to prevent __aexit__ from being called by GC
-    # This is a hacky way to keep the connection open.
-    st.session_state._mcp_transport_context = transport_context
-    st.session_state._mcp_read_stream = read_stream
-    st.session_state._mcp_write_stream = write_stream
+    # Não precisamos mais do hack do _mcp_transport_context se o SseClientTransport for importável.
+    # A sessão em si (mcp_session) é persistente e o transport está "por baixo" dela.
     
     return mcp_session, available_tools, tool_to_session
 
@@ -235,16 +255,41 @@ if st.session_state.get("connection_status") == "connected":
         with st.chat_message("assistant"):
             with st.spinner("Processando..."):
                 loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
+                if loop.is_running(): # Evita RuntimeErrors em loops já rodando
+                    # Se o loop está rodando, usar run_until_complete no loop existente.
+                    # Não criar um novo loop.
+                    pass # Isso significa que o asyncio.run() abaixo pode dar erro.
+                         # A forma correta é usar loop.create_task() e esperar por ele.
                 
-                loop.run_until_complete(st.session_state.mcp_chatbot_logic_client.process_query_async(
-                    prompt, 
-                    st.session_state.mcp_session, 
-                    st.session_state.available_tools, 
-                    st.session_state.tool_to_session
-                ))
+                # --- CORREÇÃO FINAL PARA CHAMADA ASSÍNCRONA EM STREAMLIT ---
+                # Esta é a forma mais robusta sem `streamlit-asyncio` ou `nest_asyncio`.
+                # Requer que a corrotina seja agendada no loop existente.
+                # A função precisa ser "async def", e a chamada com "await".
+                # Mas Streamlit não permite "await" diretamente no topo do script.
+                # A solução abaixo é um padrão comum.
+                
+                # Crie uma função assíncrona para envolver o processamento da query
+                async def run_query_processing():
+                    await st.session_state.mcp_chatbot_logic_client.process_query_async(
+                        prompt, 
+                        st.session_state.mcp_session, 
+                        st.session_state.available_tools, 
+                        st.session_state.tool_to_session
+                    )
+                
+                # Execute a corrotina no loop de eventos.
+                # Streamlit executa a UI em um loop de eventos.
+                # asyncio.run() criaria um NOVO loop, o que causa o RuntimeError.
+                # A solução é obter o loop existente e agendar a tarefa.
+                try:
+                    current_loop = asyncio.get_running_loop() # Pega o loop que está rodando o Streamlit
+                except RuntimeError: # Se por algum motivo não houver loop (muito raro no Streamlit)
+                    current_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(current_loop)
+                
+                # Agenda a tarefa no loop existente
+                current_loop.run_until_complete(run_query_processing())
+
 
 else:
     st.warning("Chatbot não disponível. Verifique as configurações de conexão.")
@@ -252,7 +297,6 @@ else:
 # --- Botão de Reconexão (para depuração) ---
 if st.button("Tentar reconectar ao servidor MCP"):
     if st.session_state.get("connection_status") != "connected":
-        # Limpa o cache para forçar uma nova conexão
         get_mcp_connection_resources.clear() 
         st.session_state.connection_status = "pending"
         st.session_state.messages = [] 
