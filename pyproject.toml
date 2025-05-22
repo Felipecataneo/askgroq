@@ -1,0 +1,13 @@
+[project]
+name = "chatbot-streamlit"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "groq>=0.25.0",
+    "mcp>=1.9.0",
+    "nest-asyncio>=1.6.0",
+    "python-dotenv>=1.1.0",
+    "streamlit>=1.45.1",
+]

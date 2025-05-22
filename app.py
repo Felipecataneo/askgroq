@@ -152,7 +152,7 @@ async def process_query_with_tools(query: str, groq_client: Groq, sse_url: str):
                 # Chamada para o Groq
                 chat_completion = groq_client.chat.completions.create(
                     messages=messages,
-                    model="llama3-8b-8192", 
+                    model="llama3-70b-8192", 
                     tools=available_tools,
                     tool_choice="auto",
                     max_tokens=2024
